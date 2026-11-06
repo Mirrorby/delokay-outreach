@@ -4,23 +4,23 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 import os
-from pathlib import Path
 import secrets
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Europe/Minsk')
 SETTINGS = 'Рассылка — настройки'
 JOURNAL = 'Рассылка — журнал'
+TEMPLATES = 'Рассылка — сообщения'
 HEADERS = ['Ключ', 'Значение', 'Описание']
-LOG_HEADERS = ['Telegram ID', 'Лист', 'Строка', 'Состояние', 'Время', 'Message ID', 'Результат']
-DEFAULT_MESSAGE = (
-    'Привет! Я делаю Delokay — сервис, в котором можно собрать свой '
-    'интернет-каталог с товарами и приёмом заказов, а управлять им из Telegram.\n\n'
-    'Могу показать пример, как это выглядит для небольшого магазина. Вам актуально?'
-)
+LOG_HEADERS = ['Telegram ID', 'Лист', 'Строка', 'Состояние', 'Время', 'Message ID', 'Результат',
+               '№ варианта', 'Текст сообщения']
+TEMPLATE_HEADERS = ['№', 'Первое сообщение']
+QUEUED = 'В очереди'
 DEFAULTS = [
     ['Включено', 'Нет', 'Да — автоматическая отправка; Нет — пауза'],
-    ['Первое сообщение', DEFAULT_MESSAGE, 'Один текст, без ИИ и автоматических продолжений'],
+    ['Лист сообщений', TEMPLATES, 'Заполните все 10 сообщений в указанном листе'],
+    ['Лист контактов', 'YARDSALE.MD Chat', 'Только участники этого Telegram-листа'],
+    ['Размер теста', '204', 'Фиксированный список получателей сохранён в журнале; новые автоматически не добавляются'],
     ['Лимит в день', '10', 'Учитываются и незавершённые попытки; максимум 15'],
     ['Интервал минут', '40', 'Минимальный интервал между попытками'],
     ['Начало работы', '11', 'Час по Минску, включительно'],
@@ -74,7 +74,16 @@ def setup(book):
     missing = [r for r in DEFAULTS if r[0] not in existing]
     if missing:
         ws.append_rows(missing, value_input_option='RAW')
-    worksheet(book, JOURNAL, LOG_HEADERS, create=True)
+    logws = worksheet(book, JOURNAL, LOG_HEADERS, create=True)
+    tws = worksheet(book, TEMPLATES, TEMPLATE_HEADERS, create=True)
+    if len(tws.get_all_values()) == 1:
+        tws.append_rows([[str(i), ''] for i in range(1, 11)], value_input_option='RAW')
+    if len(logws.get_all_values()) == 1:
+        _, cfg = settings(book)
+        candidates = collect_candidates(book, [], cfg['Лист контактов'][0])
+        count = int(cfg['Размер теста'][0])
+        logws.append_rows([[uid, tab.title, str(row), QUEUED, '', '', '', '', '']
+                           for uid, _, tab, row, _ in candidates[:count]], value_input_option='RAW')
     summary('Настройки и журнал готовы. Существующие контакты не изменены.')
 
 
@@ -95,13 +104,13 @@ def set_setting(ws, data, key, value):
     ws.update_cell(data[key][1], 2, value)
 
 
-def collect_candidates(book, journal):
+def collect_candidates(book, journal, source_title=None):
     """Scan only collector tabs; globally deduplicate IDs and prior contact dates."""
-    blocked = {str(r[0]) for r in journal if r and r[0]}
+    blocked = {str(r[0]) for r in journal if r and r[0] and (len(r) < 4 or r[3] != QUEUED)}
     all_candidates = []
     seen = set()
     for ws in book.worksheets():
-        if ws.title in {SETTINGS, JOURNAL}:
+        if ws.title in {SETTINGS, JOURNAL, TEMPLATES} or (source_title and ws.title != source_title):
             continue
         header = ws.row_values(1)
         required = ['Telegram ID', 'Username', 'Бот', 'Удалённый аккаунт',
@@ -128,12 +137,36 @@ def collect_candidates(book, journal):
     return result
 
 
+def read_templates(book, title):
+    ws = worksheet(book, title, TEMPLATE_HEADERS)
+    return validate_templates(ws.get_all_values()[1:])
+
+
+def validate_templates(rows):
+    messages = {}
+    for row in rows:
+        if not row or not any(row):
+            continue
+        if len(row) < 2 or not str(row[0]).isdigit() or not row[1].strip():
+            raise ValueError('Заполните тексты всех 10 сообщений.')
+        number, text = int(row[0]), row[1].strip()
+        if number in messages or len(text) > 3500:
+            raise ValueError('Повтор номера варианта или слишком длинное сообщение.')
+        messages[number] = text
+    if set(messages) != set(range(1, 11)):
+        raise ValueError('Нужны ровно 10 сообщений с номерами 1–10.')
+    return messages
+
+
+def next_template(logs):
+    # Skips and failed/uncertain attempts do not advance the rotation.
+    delivered = sum(len(r) > 3 and r[3] == 'Отправлено' for r in logs)
+    return delivered % 10 + 1
+
+
 def check_limits(cfg, logs, now):
     if cfg['Включено'][0].strip().lower() != 'да':
         return 'Отправка на паузе.'
-    message = cfg['Первое сообщение'][0].strip()
-    if not message or len(message) > 3500:
-        raise ValueError('Сообщение пустое или длиннее 3500 символов.')
     start, end = int(cfg['Начало работы'][0]), int(cfg['Конец работы'][0])
     if not 0 <= start < end <= 24:
         raise ValueError('Некорректное рабочее окно.')
@@ -170,12 +203,18 @@ async def run(mode):
     logws = worksheet(book, JOURNAL, LOG_HEADERS)
     logs = logws.get_all_values()[1:]
     if mode in {'enable', 'pause'}:
-        if mode == 'enable' and not cfg['Первое сообщение'][0].strip():
-            raise ValueError('Сначала заполните текст сообщения.')
+        if mode == 'enable':
+            read_templates(book, cfg['Лист сообщений'][0])
+            if not any(len(r) > 3 and r[3] == QUEUED for r in logs):
+                raise ValueError('В фиксированной очереди нет получателей.')
         set_setting(sws, cfg, 'Включено', 'Да' if mode == 'enable' else 'Нет')
         summary('Автоотправка включена.' if mode == 'enable' else 'Автоотправка остановлена.')
         return
-    candidates = collect_candidates(book, logs)
+    candidates = collect_candidates(book, logs, cfg['Лист контактов'][0])
+    queued = {r[0]: i for i, r in enumerate(logs, 2) if len(r) > 3 and r[3] == QUEUED}
+    if len({r[0] for r in logs if r}) != len([r for r in logs if r]):
+        raise ValueError('В журнале повторяется Telegram ID.')
+    candidates = [c for c in candidates if c[0] in queued]
     summary(f'Подходящих новых Telegram-контактов: {len(candidates)}. '
             'Instagram не обрабатывается. Контакты без username пропускаются.')
     if mode == 'send':
@@ -184,11 +223,19 @@ async def run(mode):
             summary(reason)
             return
         if not candidates:
+            set_setting(sws, cfg, 'Включено', 'Нет')
+            summary('Тест завершён или доступная очередь исчерпана. Автоотправка выключена.')
+            return
+    if mode in {'send', 'test'}:
+        try:
+            messages = read_templates(book, cfg['Лист сообщений'][0])
+        except ValueError:
+            summary('Отправки нет: заполните все 10 сообщений с номерами 1–10 в отдельном листе.')
             return
 
     from telethon import TelegramClient, functions, types
     from telethon.sessions import StringSession
-    from telethon.errors import FloodWaitError, PeerFloodError, RPCError
+    from telethon.errors import FloodWaitError, PeerFloodError
     client = TelegramClient(StringSession(os.environ['TELEGRAM_SESSION']),
                             int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'],
                             flood_sleep_threshold=0, request_retries=0, connection_retries=1,
@@ -201,17 +248,18 @@ async def run(mode):
         summary('Telegram-сессия авторизована. ИИ и обработчиков входящих сообщений нет.')
         if mode == 'check':
             return
-        message = cfg['Первое сообщение'][0].strip()
+        variant = next_template(logs)
+        message = messages[variant]
         if mode == 'test':
             await client.send_message('me', message, parse_mode=None, link_preview=False)
             summary('Текст отправлен только в ваше «Избранное». Контактам ничего не отправлено.')
             return
         uid, data, ws, number, header = candidates[0]
         # Claim before any Telegram operation. Unknown failures stay claimed and never retry automatically.
-        logrow = len(logs) + 2
+        logrow = queued[uid]
         when = stamp()
-        logws.append_row([uid, ws.title, str(number), 'Обработка', when, '', ''],
-                         value_input_option='RAW')
+        logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Обработка', when, '', '']],
+                     value_input_option='RAW')
         try:
             entity = await client.get_entity(data['Username'].strip().lstrip('@'))
             if not isinstance(entity, types.User) or str(entity.id) != uid or entity.bot or entity.deleted or entity.id == me.id:
@@ -231,13 +279,15 @@ async def run(mode):
                 logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Пропущен', when, '', 'Строка изменена']])
                 return
             # Source claim prevents sends even if a separate caller bypasses this journal.
+            logws.update(range_name=f'H{logrow}:I{logrow}', values=[[str(variant), message]],
+                         value_input_option='RAW')
             patch_source(ws, number, header, 'Написал', when)
             result = await client(functions.messages.SendMessageRequest(
                 peer=await client.get_input_entity(entity), message=message,
                 random_id=secrets.randbits(63), no_webpage=True))
             msg_id = getattr(result, 'id', '')
             logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Отправлено', when, str(msg_id), '']])
-            summary('Отправлено одно первое сообщение. Дальнейших автоответов не будет.')
+            summary(f'Отправлено одно первое сообщение, вариант №{variant}. Дальнейших автоответов не будет.')
         except (FloodWaitError, PeerFloodError) as exc:
             seconds = exc.seconds if isinstance(exc, FloodWaitError) else 86400
             set_setting(sws, cfg, 'Пауза до', stamp(datetime.now(TZ) + timedelta(seconds=seconds + 60)))

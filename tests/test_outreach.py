@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime
-from outreach import DEFAULTS, TZ, stamp, check_limits, collect_candidates
+from outreach import DEFAULTS, TZ, stamp, check_limits, collect_candidates, validate_templates, next_template
 
 
 HEADER = ['Telegram ID', 'Username', 'Бот', 'Удалённый аккаунт', 'Статус', 'Дата первого сообщения']
@@ -23,6 +23,26 @@ class Book:
 
 
 class Safeguards(unittest.TestCase):
+    def test_all_ten_templates_required(self):
+        rows = [[str(i), f'Text {i}'] for i in range(1, 11)]
+        self.assertEqual(len(validate_templates(rows)), 10)
+        for invalid in [rows[:9], rows + [rows[0]], [[1, '']] + rows[1:]]:
+            with self.assertRaises(ValueError):
+                validate_templates(invalid)
+
+    def test_rotation_204_deliveries_balanced_and_skips_dont_advance(self):
+        logs, counts = [], {i: 0 for i in range(1, 11)}
+        for i in range(204):
+            number = next_template(logs)
+            counts[number] += 1
+            logs += [[str(i), '', '', 'Отправлено'], ['skip', '', '', 'Пропущен']]
+        self.assertEqual(list(counts.values()), [21]*4 + [20]*6)
+
+    def test_pending_queue_is_not_treated_as_already_sent(self):
+        a = Sheet('A', [HEADER, ['1', '@one', 'Нет', 'Нет', 'Новый', '']])
+        self.assertEqual(len(collect_candidates(Book(a), [['1', '', '', 'В очереди']], 'A')), 1)
+        self.assertEqual(collect_candidates(Book(a), [], 'Different source'), [])
+
     def test_global_duplicates_and_existing_contact_in_other_group(self):
         a = Sheet('A', [HEADER, ['1', '@one', 'Нет', 'Нет', 'Новый', ''],
                        ['2', '@two', 'Нет', 'Нет', 'Новый', '']])
