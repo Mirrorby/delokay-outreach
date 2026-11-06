@@ -1,0 +1,57 @@
+import unittest
+from datetime import datetime
+from outreach import DEFAULTS, TZ, stamp, check_limits, collect_candidates
+
+
+HEADER = ['Telegram ID', 'Username', 'Бот', 'Удалённый аккаунт', 'Статус', 'Дата первого сообщения']
+
+
+class Sheet:
+    def __init__(self, title, rows):
+        self.title, self.rows = title, rows
+    def row_values(self, n):
+        return self.rows[n - 1]
+    def get_all_values(self):
+        return self.rows
+
+
+class Book:
+    def __init__(self, *sheets):
+        self.sheets = sheets
+    def worksheets(self):
+        return self.sheets
+
+
+class Safeguards(unittest.TestCase):
+    def test_global_duplicates_and_existing_contact_in_other_group(self):
+        a = Sheet('A', [HEADER, ['1', '@one', 'Нет', 'Нет', 'Новый', ''],
+                       ['2', '@two', 'Нет', 'Нет', 'Новый', '']])
+        b = Sheet('B', [HEADER, ['1', '@one', 'Нет', 'Нет', 'Написал', 'yesterday'],
+                       ['2', '@two', 'Нет', 'Нет', 'Новый', '']])
+        self.assertEqual([x[0] for x in collect_candidates(Book(a, b), [])], ['2'])
+
+    def test_uncertain_attempt_never_retried(self):
+        a = Sheet('A', [HEADER, ['1', '@one', 'Нет', 'Нет', 'Новый', '']])
+        self.assertEqual(collect_candidates(Book(a), [['1', '', '', 'Обработка']]), [])
+
+    def test_deleted_bots_and_missing_username_excluded(self):
+        a = Sheet('A', [HEADER, ['1', '', 'Нет', 'Нет', 'Новый', ''],
+                       ['2', '@two', 'Да', 'Нет', 'Новый', ''],
+                       ['3', '@three', 'Нет', 'Да', 'Новый', '']])
+        self.assertEqual(collect_candidates(Book(a), []), [])
+
+    def test_pause_day_limit_interval_and_off_hours(self):
+        cfg = {r[0]: (r[1], i) for i, r in enumerate(DEFAULTS)}
+        now = datetime(2026, 11, 6, 12, 0, tzinfo=TZ)
+        self.assertIsNotNone(check_limits(cfg, [], now))
+        cfg['Включено'] = ('Да', 0)
+        self.assertIsNone(check_limits(cfg, [], now))
+        logs = [['1', '', '', 'Обработка', stamp(now)]]
+        self.assertIsNotNone(check_limits(cfg, logs, now))
+        cfg['Лимит в день'] = ('1', 0)
+        self.assertEqual(check_limits(cfg, logs, now), 'Дневной лимит исчерпан.')
+        self.assertIsNotNone(check_limits(cfg, [], now.replace(hour=23)))
+
+
+if __name__ == '__main__':
+    unittest.main()
