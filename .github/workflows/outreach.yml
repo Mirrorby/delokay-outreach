@@ -5,7 +5,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [check, setup, test, send, enable, pause]
+        options: [check, setup, test, send, enable, pause, notify-test]
         default: check
   workflow_call:
     inputs:

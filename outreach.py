@@ -22,11 +22,107 @@ DEFAULTS = [
     ['Лист контактов', 'YARDSALE.MD Chat', 'Только участники этого Telegram-листа'],
     ['Размер теста', '204', 'Фиксированный список получателей сохранён в журнале; новые автоматически не добавляются'],
     ['Лимит в день', '10', 'Учитываются и незавершённые попытки; максимум 15'],
-    ['Интервал минут', '40', 'Минимальный интервал между попытками'],
-    ['Начало работы', '11', 'Час по Минску, включительно'],
-    ['Конец работы', '18', 'Час по Минску, не включительно'],
+    ['Интервал минут', '10', 'Минимальный интервал между попытками'],
+    ['Начало работы', '9', 'Час по Минску, включительно'],
+    ['Конец работы', '20', 'Час по Минску, не включительно'],
     ['Пауза до', '', 'Автоматическая пауза Telegram; очистить после проверки'],
+    ['ID уведомлений', '', 'Личный Telegram ID для сообщений об остановке'],
+    ['Последнее уведомление', '', 'Результат отправки или причина ошибки'],
+    ['Служебные данные уведомлений', '', 'Заполняет скрипт; не изменять'],
+    ['Последняя остановка', '', 'Полный отчёт сохраняется даже при недоступности Telegram'],
 ]
+
+RESTRICTION_ERRORS = {
+    'FloodWaitError', 'FloodPremiumWaitError', 'PeerFloodError',
+    'UserDeactivatedBanError', 'PhoneNumberBannedError', 'UserRestrictedError',
+    'AuthKeyUnregisteredError', 'AuthKeyDuplicatedError', 'SessionRevokedError',
+    'SessionExpiredError', 'UserDeactivatedError', 'FrozenMethodInvalidError',
+}
+
+
+def is_restriction(exc):
+    return type(exc).__name__ in RESTRICTION_ERRORS
+
+
+def restriction_report(exc, logs, context=None):
+    context = context or {}
+    now = datetime.now(TZ)
+    seconds = getattr(exc, 'seconds', None)
+    period = (f'{seconds} секунд; не ранее {stamp(now + timedelta(seconds=seconds))} по Минску'
+              if seconds is not None else 'Telegram не сообщил срок ограничения')
+    delivered = sum(len(r) > 3 and r[3] == 'Отправлено' for r in logs)
+    run_id = os.getenv('GITHUB_RUN_ID')
+    repo = os.getenv('GITHUB_REPOSITORY')
+    link = f'https://github.com/{repo}/actions/runs/{run_id}' if repo and run_id else 'нет ссылки'
+    return (
+        '⛔ Отправка Delokay остановлена\n\n'
+        f'Время: {stamp(now)} (Минск)\n'
+        f'Ошибка Telegram: {type(exc).__name__}\n'
+        f'Ответ Telegram: {str(getattr(exc, "message", type(exc).__name__))[:500]}\n'
+        f'Код: {getattr(exc, "code", "не указан")}\n'
+        f'Срок: {period}\n'
+        f'Последний контакт: {context.get("uid", "отправка ещё не началась")}\n'
+        f'Источник: {context.get("source", "—")}, строка {context.get("row", "—")}\n'
+        f'Вариант сообщения: {context.get("variant", "—")}\n'
+        f'Подтверждённых отправок в тесте: {delivered} / 204\n'
+        f'Запуск: {link}\n\n'
+        'Автоотправка выключена. Автоматического возобновления и повтора этому '
+        'контакту не будет. Проверьте @SpamBot и журнал перед ручным включением.'
+    )
+
+
+async def notification_peer(client, sws, cfg):
+    owner_id = int(cfg['ID уведомлений'][0])
+    if owner_id <= 0:
+        raise ValueError('Некорректный ID уведомлений.')
+    cached = cfg['Служебные данные уведомлений'][0]
+    if cached:
+        from telethon.tl.types import InputPeerUser
+        data = json.loads(cached)
+        if int(data['id']) == owner_id:
+            return InputPeerUser(owner_id, int(data['access_hash']))
+    try:
+        peer = await client.get_input_entity(owner_id)
+    except ValueError:
+        peer = None
+    if peer is None:
+        async for dialog in client.iter_dialogs(limit=200):
+            if dialog.is_user and dialog.id == owner_id:
+                peer = dialog.input_entity
+                break
+    if getattr(peer, 'user_id', None) != owner_id:
+        raise ValueError('Нет диалога с заданным личным аккаунтом.')
+    set_setting(sws, cfg, 'Служебные данные уведомлений', json.dumps(
+        {'id': owner_id, 'access_hash': peer.access_hash}))
+    return peer
+
+
+async def notify_owner(client, sws, cfg, text):
+    try:
+        peer = await notification_peer(client, sws, cfg)
+        await asyncio.wait_for(client.send_message(peer, text, parse_mode=None, link_preview=False), timeout=20)
+        set_setting(sws, cfg, 'Последнее уведомление', f'{stamp()} — отправлено')
+        summary('Уведомление отправлено в настроенный личный аккаунт.')
+        return True
+    except Exception as exc:
+        set_setting(sws, cfg, 'Последнее уведомление', f'{stamp()} — не отправлено: {type(exc).__name__}')
+        summary('Не удалось доставить уведомление. Причина записана в настройках; отправка не возобновляется.')
+        return False
+
+
+async def stop_for_restriction(client, sws, cfg, logs, exc, logws=None, logrow=None, context=None):
+    # Persist the stop before attempting an alert; alert failures must never restart outreach.
+    set_setting(sws, cfg, 'Включено', 'Нет')
+    seconds = getattr(exc, 'seconds', None)
+    set_setting(sws, cfg, 'Пауза до',
+                stamp(datetime.now(TZ) + timedelta(seconds=seconds + 60)) if seconds is not None else '')
+    if logws is not None and logrow is not None:
+        logws.update(range_name=f'D{logrow}:G{logrow}',
+                     values=[['Остановлено Telegram', stamp(), '', type(exc).__name__]])
+    summary('Telegram ограничил работу аккаунта. Автоотправка выключена до ручного включения.')
+    report = restriction_report(exc, logs, context)
+    set_setting(sws, cfg, 'Последняя остановка', report)
+    await notify_owner(client, sws, cfg, report)
 
 
 def stamp(now=None):
@@ -175,8 +271,8 @@ def check_limits(cfg, logs, now):
     if cfg['Пауза до'][0] and now < parse_stamp(cfg['Пауза до'][0]):
         return 'Действует пауза Telegram.'
     limit, interval = int(cfg['Лимит в день'][0]), int(cfg['Интервал минут'][0])
-    if not 1 <= limit <= 15 or interval < 30:
-        raise ValueError('Лимит должен быть 1–15; интервал не меньше 30 минут.')
+    if not 1 <= limit <= 15 or interval < 10:
+        raise ValueError('Лимит должен быть 1–15; интервал не меньше 10 минут.')
     times = [parse_stamp(r[4]) for r in logs if len(r) > 4 and r[4]]
     if sum(t.date() == now.date() for t in times) >= limit:
         return 'Дневной лимит исчерпан.'
@@ -235,7 +331,6 @@ async def run(mode):
 
     from telethon import TelegramClient, functions, types
     from telethon.sessions import StringSession
-    from telethon.errors import FloodWaitError, PeerFloodError
     client = TelegramClient(StringSession(os.environ['TELEGRAM_SESSION']),
                             int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'],
                             flood_sleep_threshold=0, request_retries=0, connection_retries=1,
@@ -246,6 +341,17 @@ async def run(mode):
             raise ValueError('Telegram-сессия не авторизована; интерактивный вход отключён.')
         me = await client.get_me()
         summary('Telegram-сессия авторизована. ИИ и обработчиков входящих сообщений нет.')
+        if mode == 'notify-test':
+            success = await notify_owner(client, sws, cfg,
+                '✅ Тест уведомлений Delokay.\n\nЭто проверка доставки с рабочего '
+                'аккаунта на личный. Ограничения Telegram сейчас не обнаружены.\n'
+                'При ограничении отправка выключится, а сюда придёт отчёт с '
+                'причиной, временем, сроком ожидания и ссылкой на запуск.\n\n'
+                'Настроенный интервал — 10 минут; окно — 09:00–20:00 по Минску; '
+                'дневной лимит — 10 попыток.')
+            if not success:
+                raise RuntimeError('Тест уведомления не прошёл.')
+            return
         if mode == 'check':
             return
         variant = next_template(logs)
@@ -288,24 +394,27 @@ async def run(mode):
             msg_id = getattr(result, 'id', '')
             logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Отправлено', when, str(msg_id), '']])
             summary(f'Отправлено одно первое сообщение, вариант №{variant}. Дальнейших автоответов не будет.')
-        except (FloodWaitError, PeerFloodError) as exc:
-            seconds = exc.seconds if isinstance(exc, FloodWaitError) else 86400
-            set_setting(sws, cfg, 'Пауза до', stamp(datetime.now(TZ) + timedelta(seconds=seconds + 60)))
-            set_setting(sws, cfg, 'Включено', 'Нет')
-            logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Остановлено Telegram', when, '', type(exc).__name__]])
-            summary('Telegram ограничил отправку. Автоотправка выключена; повторов и ожидания в runner нет.')
         except Exception as exc:
+            if is_restriction(exc):
+                await stop_for_restriction(client, sws, cfg, logs, exc, logws, logrow,
+                    {'uid': uid, 'source': ws.title, 'row': number, 'variant': variant})
+                return
             # Never emit exception text: it can contain usernames, message text or credentials.
             logws.update(range_name=f'D{logrow}:G{logrow}', values=[['Проверить вручную', when, '', type(exc).__name__]])
             summary('Попытка остановлена. Проверьте журнал; автоматического повтора этому контакту нет.')
             raise RuntimeError('Отправка не подтверждена; проверьте журнал.') from None
+    except Exception as exc:
+        if is_restriction(exc):
+            await stop_for_restriction(client, sws, cfg, logs, exc)
+        else:
+            raise
     finally:
         await client.disconnect()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['setup', 'check', 'test', 'send', 'enable', 'pause'])
+    parser.add_argument('mode', choices=['setup', 'check', 'test', 'send', 'enable', 'pause', 'notify-test'])
     args = parser.parse_args()
     try:
         asyncio.run(asyncio.wait_for(run(args.mode), timeout=150))
