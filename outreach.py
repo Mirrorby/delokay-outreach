@@ -37,7 +37,12 @@ RESTRICTION_ERRORS = {
     'UserDeactivatedBanError', 'PhoneNumberBannedError', 'UserRestrictedError',
     'AuthKeyUnregisteredError', 'AuthKeyDuplicatedError', 'SessionRevokedError',
     'SessionExpiredError', 'UserDeactivatedError', 'FrozenMethodInvalidError',
+    'SessionUnavailableError',
 }
+
+
+class SessionUnavailableError(RuntimeError):
+    pass
 
 
 def is_restriction(exc):
@@ -338,7 +343,7 @@ async def run(mode):
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            raise ValueError('Telegram-сессия не авторизована; интерактивный вход отключён.')
+            raise SessionUnavailableError('Telegram-сессия больше не авторизована.')
         me = await client.get_me()
         summary('Telegram-сессия авторизована. ИИ и обработчиков входящих сообщений нет.')
         if mode == 'notify-test':
