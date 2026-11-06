@@ -109,7 +109,7 @@ class AlertSafeguards(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(k == 'Последняя остановка' for k, v in events))
             return False
         exc = type('FloodWaitError', (Exception,), {'seconds': 90, 'code': 420})()
-        with patch('outreach.set_setting', side_effect=record), patch('outreach.notify_owner', side_effect=fail_alert):
+        with patch('outreach.set_setting', side_effect=record), patch('outreach.notify_owner', side_effect=fail_alert), patch('outreach.summary'):
             await stop_for_restriction(None, None, cfg, [], exc)
         self.assertEqual(events[0], ('Включено', 'Нет'))
         self.assertFalse(any(k == 'Включено' and v == 'Да' for k, v in events))

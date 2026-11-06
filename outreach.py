@@ -301,6 +301,9 @@ async def run(mode):
         setup(book)
         return
     sws, cfg = settings(book)
+    if 'Последний запуск' in cfg:
+        set_setting(sws, cfg, 'Последний запуск',
+                    f'{stamp()} — {os.getenv("GITHUB_EVENT_NAME", "local")} / {mode}')
     logws = worksheet(book, JOURNAL, LOG_HEADERS)
     logs = logws.get_all_values()[1:]
     if mode in {'enable', 'pause'}:
